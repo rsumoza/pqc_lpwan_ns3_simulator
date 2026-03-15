@@ -1,6 +1,6 @@
-# Reproducible Artifact for the Frozen PQC LoRaWAN Exchange Simulator
+# PQC LoRaWAN Exchange Simulator
 
-This repository is a **drop-in reproducibility layer** around the frozen ns-3 simulator and scratch driver `lpwan-pqc-export-exchanges.cc`. It does **not** modify simulator code. Its purpose is to let another researcher reproduce experiments, regenerate datasets, rebuild figures, and recreate paper tables from the stable `ExchangeResult` CSV contract.
+This repository is a **drop-in reproducibility layer** around the frozen ns-3 simulator and scratch driver `lpwan-pqc-export-exchanges.cc`. Its purpose is to let another researcher reproduce experiments, regenerate datasets, rebuild figures, and recreate paper tables from the stable `ExchangeResult` CSV contract.
 
 ## Repository structure
 
