@@ -1,0 +1,13 @@
+lambda_eff,pacing,S_ex_mean,n
+0.0,Baseline,0.0,800
+0.5,Baseline,0.0,800
+1.0,Baseline,0.0,800
+2.0,Baseline,0.0,800
+0.0,Phase-bounded,0.99625,800
+0.5,Phase-bounded,0.99625,800
+1.0,Phase-bounded,0.995,800
+2.0,Phase-bounded,0.99375,800
+0.0,Stochastic,0.995,800
+0.5,Stochastic,0.995,800
+1.0,Stochastic,0.99125,800
+2.0,Stochastic,0.9925,800

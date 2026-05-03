@@ -1,0 +1,10 @@
+T_ECW_s,pacing,S_ex,n,lambda_scope
+3.0,Baseline,0.0,800,lambda=1
+3.0,Stochastic,0.01125,800,lambda=1
+3.0,Phase-bounded,0.94125,800,lambda=1
+5.0,Baseline,0.0,800,lambda=1
+5.0,Stochastic,0.97375,800,lambda=1
+5.0,Phase-bounded,0.995,800,lambda=1
+8.0,Baseline,0.0,800,lambda=1
+8.0,Stochastic,0.99125,800,lambda=1
+8.0,Phase-bounded,0.995,800,lambda=1

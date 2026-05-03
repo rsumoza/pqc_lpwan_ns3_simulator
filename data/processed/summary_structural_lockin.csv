@@ -1,0 +1,4 @@
+pacing,S_ex_mean,exchange_latency_mean_s,n
+Baseline,0.0,0.274976,800
+Phase-bounded,1.0,1.7921385,800
+Stochastic,1.0,3.6143545875000003,800

@@ -1,0 +1,844 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="full"            # full | campaigns | figures
+SUITE="all"            # structural | main | robustness | ecw | validation | all
+JOBS="1"
+TIMEOUT_S="600"
+SLEEP_BETWEEN_JOBS="1"
+NS3_NO_BUILD="true"
+PROGRAM="lpwan-pqc-export-exchanges"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/bash/run_temporal_exploration_pipeline.sh [options]
+
+Options:
+  --mode <full|campaigns|figures>
+      full      : run selected campaigns and then generate figures
+      campaigns : run selected campaigns only
+      figures   : generate figures from existing merged CSVs only
+
+  --suite <structural|main|robustness|ecw|validation|all>
+      structural : run/generate structural campaign artifacts
+      main       : run/generate main load-sweep artifacts
+      robustness : run/generate spreading-factor sweep artifacts
+      ecw        : run/generate ECW sensitivity artifacts
+      validation : generate external validation artifact if CSVs exist
+      all        : all of the above
+
+  --jobs <N>
+      Number of parallel jobs for simulation campaigns.
+
+  --program <name>
+      ns-3 program name.
+
+Examples:
+  bash scripts/bash/run_temporal_exploration_pipeline.sh --mode full --suite all --jobs 16
+  bash scripts/bash/run_temporal_exploration_pipeline.sh --mode figures --suite all
+  bash scripts/bash/run_temporal_exploration_pipeline.sh --mode campaigns --suite ecw --jobs 16
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="$2"; shift 2 ;;
+    --suite) SUITE="$2"; shift 2 ;;
+    --jobs) JOBS="$2"; shift 2 ;;
+    --program) PROGRAM="$2"; shift 2 ;;
+    --timeout) TIMEOUT_S="$2"; shift 2 ;;
+    --sleep-between-jobs) SLEEP_BETWEEN_JOBS="$2"; shift 2 ;;
+    --no-build) NS3_NO_BUILD="true"; shift ;;
+    --with-build) NS3_NO_BUILD="false"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+mkdir -p scripts/python scripts/bash data/raw data/merged data/processed figures logs
+
+write_python_scripts() {
+cat > scripts/python/common_plot.py <<'PY'
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+FIGURES_DIR = Path("figures")
+PROCESSED_DIR = Path("data/processed")
+
+rcParams.update({
+    "font.family": "serif",
+    "font.size": 6,
+    "axes.labelsize": 6,
+    "axes.titlesize": 6,
+    "xtick.labelsize": 6,
+    "ytick.labelsize": 6,
+    "legend.fontsize": 6,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+def ieee_axes(ax):
+    ax.tick_params(direction="in", which="both", labelsize=6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", linestyle=":", linewidth=0.4, alpha=0.9)
+
+def ensure_dirs():
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_df(path):
+    df = pd.read_csv(path)
+    if "per_exchange_fail" in df.columns:
+        df["S_ex"] = 1.0 - df["per_exchange_fail"]
+    elif "S_ex" not in df.columns:
+        raise ValueError("Missing required column: per_exchange_fail or S_ex")
+
+    if "pacing_mode" in df.columns:
+        df["pacing"] = df["pacing_mode"].replace({
+            "baseline": "Baseline",
+            "stochastic": "Stochastic",
+            "radioaware_phase_bounded": "Phase-bounded",
+            "fixed": "Deterministic",
+        })
+    elif "pacing" not in df.columns:
+        raise ValueError("Missing required column: pacing_mode or pacing")
+
+    return df
+
+def format_lambda_value(lam: float) -> str:
+    if float(lam).is_integer():
+        return str(int(lam))
+    return f"{lam:g}"
+
+def lambda_axis_label() -> str:
+    return r"Offered load $\lambda$ (exchanges/s)"
+
+def lambda_panel_title(lam: float) -> str:
+    return rf"$\lambda = {format_lambda_value(lam)}$ exchanges/s"
+PY
+
+cat > scripts/python/plot_success_vs_lambda_main.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_axis_label, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+summary = (
+    df.groupby(["lambda_eff", "pacing"], as_index=False)
+      .agg(S_ex_mean=("S_ex", "mean"), n=("S_ex", "count"))
+      .sort_values(["pacing", "lambda_eff"])
+)
+summary.to_csv(PROCESSED_DIR / "summary_success_vs_lambda_main.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(3.5, 2.35))
+ieee_axes(ax)
+
+for mode, marker in [("Baseline", "o"), ("Stochastic", "s"), ("Phase-bounded", "^")]:
+    sub = summary[summary["pacing"] == mode]
+    if len(sub):
+        ax.plot(sub["lambda_eff"], sub["S_ex_mean"], marker=marker, linewidth=1.1, label=mode)
+
+ax.set_xlabel(lambda_axis_label())
+ax.set_ylabel(r"Exchange success probability $S_{\mathrm{ex}}$ (-)")
+ax.set_xlim(-0.05, 2.05)
+ax.set_xticks([0, 0.5, 1.0, 2.0])
+ax.set_ylim(-0.02, 1.02)
+ax.legend(frameon=False, loc="lower right", prop={"size": 6})
+
+fig.tight_layout(pad=0.5)
+fig.savefig(FIGURES_DIR / "success_vs_lambda_three_pacing.pdf", bbox_inches="tight")
+fig.savefig(FIGURES_DIR / "success_vs_lambda_three_pacing.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_success_vs_lambda_main.py
+
+cat > scripts/python/plot_latency_per_success_main.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_axis_label, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+rows = []
+for (lam, pacing), sub in df.groupby(["lambda_eff", "pacing"]):
+    succ = sub[sub["S_ex"] > 0]
+    rows.append({
+        "lambda_eff": lam,
+        "pacing": pacing,
+        "L_succ": np.nan if len(succ) == 0 else succ["exchange_latency_s"].mean(),
+        "S_ex_mean": sub["S_ex"].mean(),
+        "n": len(sub),
+        "n_success": len(succ),
+    })
+
+summary = __import__("pandas").DataFrame(rows).sort_values(["pacing", "lambda_eff"])
+summary.to_csv(PROCESSED_DIR / "summary_latency_per_success_main.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(3.5, 2.35))
+ieee_axes(ax)
+
+for mode, marker in [("Stochastic", "s"), ("Phase-bounded", "^")]:
+    sub = summary[summary["pacing"] == mode]
+    if len(sub):
+        ax.plot(sub["lambda_eff"], sub["L_succ"], marker=marker, linewidth=1.1, label=mode)
+
+ax.set_xlabel(lambda_axis_label())
+ax.set_ylabel(r"Latency per successful exchange $L_{\mathrm{succ}}$ (s)")
+ax.set_xlim(0.45, 2.05)
+ax.set_xticks([0.5, 1.0, 2.0])
+ax.legend(frameon=False, loc="upper right", prop={"size": 6})
+
+fig.tight_layout(pad=0.5)
+fig.savefig(FIGURES_DIR / "latency_per_success_three_pacing.pdf", bbox_inches="tight")
+fig.savefig(FIGURES_DIR / "latency_per_success_three_pacing.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_latency_per_success_main.py
+
+cat > scripts/python/plot_energy_per_success_main.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_axis_label, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+rows = []
+for (lam, pacing), sub in df.groupby(["lambda_eff", "pacing"]):
+    succ = sub[sub["S_ex"] > 0]
+    rows.append({
+        "lambda_eff": lam,
+        "pacing": pacing,
+        "E_succ": np.nan if len(succ) == 0 else succ["energy_j_exchange"].mean(),
+        "S_ex_mean": sub["S_ex"].mean(),
+        "n": len(sub),
+        "n_success": len(succ),
+    })
+
+summary = __import__("pandas").DataFrame(rows).sort_values(["pacing", "lambda_eff"])
+summary.to_csv(PROCESSED_DIR / "summary_energy_per_success_main.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(3.5, 2.35))
+ieee_axes(ax)
+
+for mode, marker in [("Stochastic", "s"), ("Phase-bounded", "^")]:
+    sub = summary[summary["pacing"] == mode]
+    if len(sub):
+        ax.plot(sub["lambda_eff"], sub["E_succ"], marker=marker, linewidth=1.1, label=mode)
+
+ax.set_xlabel(lambda_axis_label())
+ax.set_ylabel(r"Energy per successful exchange $E_{\mathrm{succ}}$ (J)")
+ax.set_xlim(0.45, 2.05)
+ax.set_xticks([0.5, 1.0, 2.0])
+ax.legend(frameon=False, loc="upper right", prop={"size": 6})
+
+fig.tight_layout(pad=0.5)
+fig.savefig(FIGURES_DIR / "energy_per_success_three_pacing.pdf", bbox_inches="tight")
+fig.savefig(FIGURES_DIR / "energy_per_success_three_pacing.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_energy_per_success_main.py
+
+cat > scripts/python/plot_success_vs_sf_robustness.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_panel_title, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+summary = (
+    df.groupby(["lambda_eff", "sf", "pacing"], as_index=False)
+      .agg(S_ex_mean=("S_ex", "mean"), n=("S_ex", "count"))
+      .sort_values(["lambda_eff", "pacing", "sf"])
+)
+summary.to_csv(PROCESSED_DIR / "summary_success_vs_sf_robustness.csv", index=False)
+
+for lam in sorted(summary["lambda_eff"].unique()):
+    sub_lam = summary[summary["lambda_eff"] == lam].copy()
+    fig, ax = plt.subplots(figsize=(3.5, 2.35))
+    ieee_axes(ax)
+
+    for mode, marker in [("Stochastic", "s"), ("Phase-bounded", "^")]:
+        sub = sub_lam[sub_lam["pacing"] == mode]
+        if len(sub):
+            ax.plot(sub["sf"], sub["S_ex_mean"], marker=marker, linewidth=1.1, label=mode)
+
+    ax.set_title(lambda_panel_title(lam), pad=2.0)
+    ax.set_xlabel("Spreading factor (SF)")
+    ax.set_ylabel(r"Exchange success probability $S_{\mathrm{ex}}$ (-)")
+    ax.set_xticks(sorted(sub_lam["sf"].unique()))
+    ax.set_ylim(0.975, 1.001)
+    ax.axhline(1.0, linestyle="--", linewidth=0.6, alpha=0.6)
+    ax.legend(frameon=False, loc="lower left", prop={"size": 6})
+
+    fig.tight_layout(pad=0.5)
+    fig.savefig(FIGURES_DIR / f"success_vs_sf_lambda_{int(lam)}.pdf", bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / f"success_vs_sf_lambda_{int(lam)}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_success_vs_sf_robustness.py
+
+cat > scripts/python/plot_latency_per_success_vs_sf_robustness.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_panel_title, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+rows = []
+for (lam, sf, pacing), sub in df.groupby(["lambda_eff", "sf", "pacing"]):
+    succ = sub[sub["S_ex"] > 0]
+    rows.append({
+        "lambda_eff": lam,
+        "sf": sf,
+        "pacing": pacing,
+        "L_succ": np.nan if len(succ) == 0 else succ["exchange_latency_s"].mean(),
+        "S_ex_mean": sub["S_ex"].mean(),
+        "n": len(sub),
+        "n_success": len(succ),
+    })
+
+summary = pd.DataFrame(rows).sort_values(["lambda_eff", "pacing", "sf"])
+summary.to_csv(PROCESSED_DIR / "summary_latency_per_success_vs_sf_robustness.csv", index=False)
+
+for lam in sorted(summary["lambda_eff"].unique()):
+    sub_lam = summary[summary["lambda_eff"] == lam].copy()
+    fig, ax = plt.subplots(figsize=(3.5, 2.35))
+    ieee_axes(ax)
+
+    for mode, marker in [("Stochastic", "s"), ("Phase-bounded", "^")]:
+        sub = sub_lam[sub_lam["pacing"] == mode]
+        if len(sub):
+            ax.plot(sub["sf"], sub["L_succ"], marker=marker, linewidth=1.1, label=mode)
+
+    ax.set_title(lambda_panel_title(lam), pad=2.0)
+    ax.set_xlabel("Spreading factor (SF)")
+    ax.set_ylabel(r"Latency per successful exchange $L_{\mathrm{succ}}$ (s)")
+    ax.set_xticks(sorted(sub_lam["sf"].unique()))
+    ax.legend(frameon=False, loc="upper left", prop={"size": 6})
+
+    fig.tight_layout(pad=0.5)
+    fig.savefig(FIGURES_DIR / f"latency_per_success_vs_sf_lambda_{int(lam)}.pdf", bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / f"latency_per_success_vs_sf_lambda_{int(lam)}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_latency_per_success_vs_sf_robustness.py
+
+cat > scripts/python/plot_energy_per_success_vs_sf_robustness.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, lambda_panel_title, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+rows = []
+for (lam, sf, pacing), sub in df.groupby(["lambda_eff", "sf", "pacing"]):
+    succ = sub[sub["S_ex"] > 0]
+    rows.append({
+        "lambda_eff": lam,
+        "sf": sf,
+        "pacing": pacing,
+        "E_succ": np.nan if len(succ) == 0 else succ["energy_j_exchange"].mean(),
+        "S_ex_mean": sub["S_ex"].mean(),
+        "n": len(sub),
+        "n_success": len(succ),
+    })
+
+summary = pd.DataFrame(rows).sort_values(["lambda_eff", "pacing", "sf"])
+summary.to_csv(PROCESSED_DIR / "summary_energy_per_success_vs_sf_robustness.csv", index=False)
+
+for lam in sorted(summary["lambda_eff"].unique()):
+    sub_lam = summary[summary["lambda_eff"] == lam].copy()
+    fig, ax = plt.subplots(figsize=(3.5, 2.35))
+    ieee_axes(ax)
+
+    for mode, marker in [("Stochastic", "s"), ("Phase-bounded", "^")]:
+        sub = sub_lam[sub_lam["pacing"] == mode]
+        if len(sub):
+            ax.plot(sub["sf"], sub["E_succ"], marker=marker, linewidth=1.1, label=mode)
+
+    ax.set_title(lambda_panel_title(lam), pad=2.0)
+    ax.set_xlabel("Spreading factor (SF)")
+    ax.set_ylabel(r"Energy per successful exchange $E_{\mathrm{succ}}$ (J)")
+    ax.set_xticks(sorted(sub_lam["sf"].unique()))
+    ax.legend(frameon=False, loc="upper left", prop={"size": 6})
+
+    fig.tight_layout(pad=0.5)
+    fig.savefig(FIGURES_DIR / f"energy_per_success_vs_sf_lambda_{int(lam)}.pdf", bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / f"energy_per_success_vs_sf_lambda_{int(lam)}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+print(summary.to_string(index=False))
+PY
+chmod +x scripts/python/plot_energy_per_success_vs_sf_robustness.py
+
+cat > scripts/python/plot_success_vs_ecw.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, load_df, FIGURES_DIR, PROCESSED_DIR
+
+ECW_VALUES = [3.0, 5.0, 8.0]
+PACING_ORDER = ["Baseline", "Stochastic", "Phase-bounded"]
+MARKERS = {"Baseline": "o", "Stochastic": "s", "Phase-bounded": "^"}
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+if "exchange_latency_s" not in df.columns:
+    raise ValueError("Missing required column: exchange_latency_s")
+
+df["completed"] = df["S_ex"] > 0
+
+lambda_col = "lambda_eff" if "lambda_eff" in df.columns else None
+if lambda_col is not None and 1.0 in set(df[lambda_col].dropna().astype(float)):
+    df_plot = df[df[lambda_col].astype(float) == 1.0].copy()
+    lambda_scope = "lambda=1"
+else:
+    df_plot = df.copy()
+    lambda_scope = "all"
+
+rows = []
+for ecw in ECW_VALUES:
+    tmp = df_plot.copy()
+    tmp["success_ecw"] = tmp["completed"] & (tmp["exchange_latency_s"] <= ecw)
+
+    for pacing in PACING_ORDER:
+        sub = tmp[tmp["pacing"] == pacing]
+        if len(sub):
+            rows.append({
+                "T_ECW_s": ecw,
+                "pacing": pacing,
+                "S_ex": sub["success_ecw"].mean(),
+                "n": len(sub),
+                "lambda_scope": lambda_scope,
+            })
+
+summary = pd.DataFrame(rows)
+summary.to_csv(PROCESSED_DIR / "summary_success_vs_ecw.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(3.5, 2.35))
+ieee_axes(ax)
+
+for pacing in PACING_ORDER:
+    sub = summary[summary["pacing"] == pacing].sort_values("T_ECW_s")
+    if len(sub):
+        ax.plot(sub["T_ECW_s"], sub["S_ex"], marker=MARKERS[pacing], linewidth=1.1, markersize=3.2, label=pacing)
+
+ax.set_xlabel(r"Exchange Completion Window $T_{\mathrm{ECW}}$ (s)")
+ax.set_ylabel(r"Exchange success probability $S_{\mathrm{ex}}$ (-)")
+ax.set_xticks(ECW_VALUES)
+ax.set_ylim(-0.02, 1.02)
+ax.legend(frameon=False, loc="lower right", prop={"size": 6})
+
+fig.tight_layout(pad=0.5)
+fig.savefig(FIGURES_DIR / "success_vs_ecw.pdf", bbox_inches="tight")
+fig.savefig(FIGURES_DIR / "success_vs_ecw.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+print(summary.to_string(index=False))
+print("[OK] wrote figures/success_vs_ecw.pdf")
+PY
+chmod +x scripts/python/plot_success_vs_ecw.py
+
+cat > scripts/python/plot_structural_summary.py <<'PY'
+#!/usr/bin/env python3
+import sys
+import numpy as np
+import pandas as pd
+from common_plot import ensure_dirs, load_df, PROCESSED_DIR
+
+ensure_dirs()
+df = load_df(sys.argv[1])
+
+summary = (
+    df.groupby("pacing", as_index=False)
+      .agg(
+          S_ex_mean=("S_ex", "mean"),
+          exchange_latency_mean_s=("exchange_latency_s", "mean"),
+          n=("S_ex", "count"),
+      )
+)
+summary.to_csv(PROCESSED_DIR / "summary_structural_lockin.csv", index=False)
+
+rows = []
+for mode in ["Stochastic", "Phase-bounded"]:
+    sub = df[(df["pacing"] == mode) & (df["S_ex"] > 0)]
+    if len(sub) == 0:
+        continue
+    x = sub["exchange_latency_s"].to_numpy()
+    rows.append({
+        "pacing": mode,
+        "n": len(x),
+        "mean_s": float(np.mean(x)),
+        "std_s": float(np.std(x, ddof=1)),
+        "p10_s": float(np.percentile(x, 10)),
+        "p25_s": float(np.percentile(x, 25)),
+        "median_s": float(np.percentile(x, 50)),
+        "p90_s": float(np.percentile(x, 90)),
+    })
+
+quant = pd.DataFrame(rows)
+quant.to_csv(PROCESSED_DIR / "summary_structural_lockin_quantiles.csv", index=False)
+
+print(summary.to_string(index=False))
+print()
+print(quant.to_string(index=False))
+PY
+chmod +x scripts/python/plot_structural_summary.py
+
+cat > scripts/python/plot_external_validation.py <<'PY'
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+from common_plot import ensure_dirs, ieee_axes, FIGURES_DIR, PROCESSED_DIR
+
+ensure_dirs()
+ref_dir = Path(sys.argv[1])
+
+rows = []
+for csvf in sorted(ref_dir.glob("*.csv")):
+    try:
+        df = pd.read_csv(csvf)
+    except Exception:
+        continue
+    rows.append({"dataset": csvf.name, "rows": len(df)})
+
+summary = pd.DataFrame(rows)
+summary.to_csv(PROCESSED_DIR / "summary_external_validation.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(3.5, 2.2))
+ieee_axes(ax)
+
+if len(summary):
+    ax.bar(summary["dataset"], summary["rows"])
+    ax.set_ylabel("Rows loaded (-)")
+    ax.set_xlabel("External validation dataset")
+    ax.tick_params(axis="x", rotation=25)
+else:
+    ax.text(0.5, 0.5, "No external validation CSVs found", ha="center", va="center", transform=ax.transAxes)
+    ax.set_axis_off()
+
+fig.tight_layout(pad=0.5)
+fig.savefig(FIGURES_DIR / "external_validation_inputs.pdf", bbox_inches="tight")
+fig.savefig(FIGURES_DIR / "external_validation_inputs.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+if len(summary):
+    print(summary.to_string(index=False))
+else:
+    print("No external validation files found.")
+PY
+chmod +x scripts/python/plot_external_validation.py
+}
+
+merge_csv_dir() {
+  local indir="$1"
+  local outcsv="$2"
+
+  python3 - "$indir" "$outcsv" <<'PY'
+from pathlib import Path
+import pandas as pd
+import sys
+
+indir = Path(sys.argv[1])
+outcsv = Path(sys.argv[2])
+outcsv.parent.mkdir(parents=True, exist_ok=True)
+
+files = sorted(indir.glob("*.csv"))
+dfs = []
+
+for f in files:
+    if f.stat().st_size == 0:
+        continue
+    try:
+        df = pd.read_csv(f)
+    except Exception:
+        continue
+    if df.empty:
+        continue
+    df["source_file"] = f.name
+    dfs.append(df)
+
+if not dfs:
+    print(f"[WARN] no valid CSV files in {indir}")
+    sys.exit(0)
+
+pd.concat(dfs, ignore_index=True, sort=False).to_csv(outcsv, index=False)
+print(f"[OK] merged -> {outcsv}")
+PY
+}
+
+run_one_job() {
+  local logfile="$1"
+  shift
+  local outcsv="$1"
+  shift
+
+  mkdir -p "$(dirname "$logfile")" "$(dirname "$outcsv")"
+
+  local ns3_cmd=(./ns3 run)
+  if [[ "$NS3_NO_BUILD" == "true" ]]; then
+    ns3_cmd+=(--no-build)
+  fi
+  ns3_cmd+=("$PROGRAM" -- "$@")
+
+  echo "[RUN] $(basename "$outcsv")"
+
+  if timeout "${TIMEOUT_S}s" nice -n 10 ionice -c2 -n7 "${ns3_cmd[@]}" >"$logfile" 2>&1; then
+    if [[ -s "$outcsv" ]]; then
+      echo "[DONE] $(basename "$outcsv")"
+    else
+      echo "[FAIL] empty_csv $(basename "$outcsv") see_log=$logfile"
+      rm -f "$outcsv"
+    fi
+  else
+    echo "[FAIL] timeout_or_error $(basename "$outcsv") see_log=$logfile"
+    rm -f "$outcsv"
+  fi
+
+  sleep "${SLEEP_BETWEEN_JOBS:-1}"
+}
+
+export PROGRAM
+export -f run_one_job
+export TIMEOUT_S
+export SLEEP_BETWEEN_JOBS
+export NS3_NO_BUILD
+
+launch_jobs() {
+  local jobs_file="$1"
+
+  [[ -s "$jobs_file" ]] || {
+    echo "[WARN] no jobs in $jobs_file"
+    return 0
+  }
+
+  echo "[INFO] Launching jobs safely"
+  echo "[INFO] JOBS=$JOBS TIMEOUT_S=$TIMEOUT_S SLEEP_BETWEEN_JOBS=$SLEEP_BETWEEN_JOBS"
+
+  if [[ "$JOBS" -le 1 ]]; then
+    while IFS= read -r job; do
+      bash -lc "$job"
+    done < "$jobs_file"
+  else
+    xargs -I{} -P "$JOBS" bash -lc "{}" < "$jobs_file"
+  fi
+}
+
+run_campaign_structural() {
+  local OUT="data/raw/structural_lockin"
+  local LOG="${OUT}/logs"
+  local JOBS_FILE="${OUT}/jobs.txt"
+  mkdir -p "$OUT" "$LOG"
+  : > "$JOBS_FILE"
+
+  local SIM_TIME=20 PERIOD_MS=500 PAYLOAD=20 OVERHEAD=1 ACK=1
+  local RXW=120 RXI=120 LAMBDA=0 LOGCH=64 SNR=8 GAPMIN=20 GAPMAX=300
+
+  for mode in baseline stochastic radioaware_phase_bounded; do
+    for run in $(seq 1 20); do
+      local outcsv="$OUT/struct_${mode}_run${run}.csv"
+      local logfile="$LOG/struct_${mode}_run${run}.log"
+      local args="--variant=struct_${mode} --outCsv=$outcsv --environment=indoor --sf=7 --simTimeS=$SIM_TIME --periodMs=$PERIOD_MS --payloadBytes=$PAYLOAD --g2gOverheadBytes=$OVERHEAD --pacing=$mode --gapMinMs=$GAPMIN --gapMaxMs=$GAPMAX --rxDutyCycleEnabled=true --rxWindowMs=$RXW --rxIdleMs=$RXI --ackBatchSize=$ACK --lambdaTotal=$LAMBDA --logicalChannels=$LOGCH --snrIndoorDb=$SNR --seed=1 --run=$run"
+      echo "run_one_job '$logfile' '$outcsv' $args" >> "$JOBS_FILE"
+    done
+  done
+
+  echo "[INFO] Campaign structural -> JOBS=$JOBS"
+  launch_jobs "$JOBS_FILE"
+  merge_csv_dir "$OUT" "data/merged/structural_lockin.csv"
+}
+
+run_campaign_main() {
+  local OUT="data/raw/main_three_pacing"
+  local LOG="${OUT}/logs"
+  local JOBS_FILE="${OUT}/jobs.txt"
+  mkdir -p "$OUT" "$LOG"
+  : > "$JOBS_FILE"
+
+  local SIM_TIME=20 PERIOD_MS=500 PAYLOAD=20 OVERHEAD=1 ACK=1
+  local RXW=120 RXI=120 LOGCH=64 SNR=-3 GAPMIN=20 GAPMAX=300
+
+  for mode in baseline stochastic radioaware_phase_bounded; do
+    for lam in 0 0.5 1 2; do
+      for run in $(seq 1 20); do
+        local outcsv="$OUT/main_${mode}_lambda${lam}_run${run}.csv"
+        local logfile="$LOG/main_${mode}_lambda${lam}_run${run}.log"
+        local args="--variant=main_${mode} --outCsv=$outcsv --environment=indoor --sf=7 --simTimeS=$SIM_TIME --periodMs=$PERIOD_MS --payloadBytes=$PAYLOAD --g2gOverheadBytes=$OVERHEAD --pacing=$mode --gapMinMs=$GAPMIN --gapMaxMs=$GAPMAX --rxDutyCycleEnabled=true --rxWindowMs=$RXW --rxIdleMs=$RXI --ackBatchSize=$ACK --lambdaTotal=$lam --logicalChannels=$LOGCH --snrIndoorDb=$SNR --seed=1 --run=$run"
+        echo "run_one_job '$logfile' '$outcsv' $args" >> "$JOBS_FILE"
+      done
+    done
+  done
+
+  echo "[INFO] Campaign main -> JOBS=$JOBS"
+  launch_jobs "$JOBS_FILE"
+  merge_csv_dir "$OUT" "data/merged/main_three_pacing.csv"
+}
+
+run_campaign_robustness() {
+  local OUT="data/raw/robustness_sf"
+  local LOG="${OUT}/logs"
+  local JOBS_FILE="${OUT}/jobs.txt"
+  mkdir -p "$OUT" "$LOG"
+  : > "$JOBS_FILE"
+
+  local PERIOD_MS=500 PAYLOAD=20 OVERHEAD=1 ACK=1 LOGCH=64 SNR=-3
+
+  for mode in stochastic radioaware_phase_bounded; do
+    for sf in 7 9 12; do
+      local SIM_TIME RXW RXI GAPMIN GAPMAX
+      case "$sf" in
+        7)  SIM_TIME=20; RXW=120;  RXI=120; GAPMIN=20; GAPMAX=240 ;;
+        9)  SIM_TIME=20; RXW=360;  RXI=120; GAPMIN=20; GAPMAX=480 ;;
+        12) SIM_TIME=60; RXW=2200; RXI=400; GAPMIN=20; GAPMAX=2600 ;;
+      esac
+
+      for lam in 1 2; do
+        for run in $(seq 1 20); do
+          local outcsv="$OUT/robust_${mode}_sf${sf}_lambda${lam}_run${run}.csv"
+          local logfile="$LOG/robust_${mode}_sf${sf}_lambda${lam}_run${run}.log"
+          local args="--variant=robust_${mode}_sf${sf} --outCsv=$outcsv --environment=indoor --sf=$sf --simTimeS=$SIM_TIME --periodMs=$PERIOD_MS --payloadBytes=$PAYLOAD --g2gOverheadBytes=$OVERHEAD --pacing=$mode --gapMinMs=$GAPMIN --gapMaxMs=$GAPMAX --rxDutyCycleEnabled=true --rxWindowMs=$RXW --rxIdleMs=$RXI --ackBatchSize=$ACK --lambdaTotal=$lam --logicalChannels=$LOGCH --snrIndoorDb=$SNR --seed=1 --run=$run"
+          echo "run_one_job '$logfile' '$outcsv' $args" >> "$JOBS_FILE"
+        done
+      done
+    done
+  done
+
+  echo "[INFO] Campaign robustness -> JOBS=$JOBS"
+  launch_jobs "$JOBS_FILE"
+  merge_csv_dir "$OUT" "data/merged/robustness_sf.csv"
+}
+
+run_campaign_ecw() {
+  local OUT="data/raw/ecw_sensitivity"
+  local LOG="${OUT}/logs"
+  local JOBS_FILE="${OUT}/jobs.txt"
+  mkdir -p "$OUT" "$LOG"
+  : > "$JOBS_FILE"
+
+  local SIM_TIME=20 PERIOD_MS=500 PAYLOAD=20 OVERHEAD=1 ACK=1
+  local RXW=120 RXI=120 LOGCH=64 SNR=-3 GAPMIN=20 GAPMAX=300 SF=7
+
+  for mode in baseline stochastic radioaware_phase_bounded; do
+    for lam in 0 0.5 1 2; do
+      for run in $(seq 1 20); do
+        local outcsv="$OUT/ecw_${mode}_lambda${lam}_run${run}.csv"
+        local logfile="$LOG/ecw_${mode}_lambda${lam}_run${run}.log"
+        local args="--variant=ecw_${mode} --outCsv=$outcsv --environment=indoor --sf=$SF --simTimeS=$SIM_TIME --periodMs=$PERIOD_MS --payloadBytes=$PAYLOAD --g2gOverheadBytes=$OVERHEAD --pacing=$mode --gapMinMs=$GAPMIN --gapMaxMs=$GAPMAX --rxDutyCycleEnabled=true --rxWindowMs=$RXW --rxIdleMs=$RXI --ackBatchSize=$ACK --lambdaTotal=$lam --logicalChannels=$LOGCH --snrIndoorDb=$SNR --seed=1 --run=$run"
+        echo "run_one_job '$logfile' '$outcsv' $args" >> "$JOBS_FILE"
+      done
+    done
+  done
+
+  echo "[INFO] Campaign ECW sensitivity -> JOBS=$JOBS"
+  launch_jobs "$JOBS_FILE"
+  merge_csv_dir "$OUT" "data/merged/ecw_sensitivity.csv"
+}
+
+run_campaign_validation() {
+  local REF_DIR="data/external"
+  mkdir -p "$REF_DIR"
+  if compgen -G "$REF_DIR/*.csv" > /dev/null; then
+    python3 scripts/python/plot_external_validation.py "$REF_DIR"
+  else
+    echo "[WARN] No external validation CSVs found in $REF_DIR"
+  fi
+}
+
+generate_figures() {
+  if [[ "$SUITE" == "structural" || "$SUITE" == "all" ]] && [[ -f data/merged/structural_lockin.csv ]]; then
+    python3 scripts/python/plot_structural_summary.py data/merged/structural_lockin.csv
+  fi
+
+  if [[ "$SUITE" == "main" || "$SUITE" == "all" ]] && [[ -f data/merged/main_three_pacing.csv ]]; then
+    python3 scripts/python/plot_success_vs_lambda_main.py data/merged/main_three_pacing.csv
+    python3 scripts/python/plot_latency_per_success_main.py data/merged/main_three_pacing.csv
+    python3 scripts/python/plot_energy_per_success_main.py data/merged/main_three_pacing.csv
+  fi
+
+  if [[ "$SUITE" == "robustness" || "$SUITE" == "all" ]] && [[ -f data/merged/robustness_sf.csv ]]; then
+    python3 scripts/python/plot_success_vs_sf_robustness.py data/merged/robustness_sf.csv
+    python3 scripts/python/plot_latency_per_success_vs_sf_robustness.py data/merged/robustness_sf.csv
+    python3 scripts/python/plot_energy_per_success_vs_sf_robustness.py data/merged/robustness_sf.csv
+  fi
+
+  if [[ "$SUITE" == "ecw" || "$SUITE" == "all" ]] && [[ -f data/merged/ecw_sensitivity.csv ]]; then
+    python3 scripts/python/plot_success_vs_ecw.py data/merged/ecw_sensitivity.csv
+  fi
+
+  if [[ "$SUITE" == "validation" || "$SUITE" == "all" ]]; then
+    run_campaign_validation || true
+  fi
+}
+
+write_python_scripts
+
+if [[ "$MODE" == "full" || "$MODE" == "campaigns" ]]; then
+  echo "[INFO] Building ns-3 program once before campaigns..."
+  ./ns3 build "$PROGRAM"
+  NS3_NO_BUILD="true"
+fi
+
+if [[ "$MODE" == "full" || "$MODE" == "campaigns" ]]; then
+  case "$SUITE" in
+    structural) run_campaign_structural ;;
+    main) run_campaign_main ;;
+    robustness) run_campaign_robustness ;;
+    ecw) run_campaign_ecw ;;
+    validation) run_campaign_validation ;;
+    all)
+      run_campaign_structural
+      run_campaign_main
+      run_campaign_robustness
+      run_campaign_ecw
+      run_campaign_validation
+      ;;
+    *)
+      echo "Unknown suite: $SUITE" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [[ "$MODE" == "full" || "$MODE" == "figures" ]]; then
+  generate_figures
+fi
+
+echo "[OK] Pipeline finished. mode=$MODE suite=$SUITE jobs=$JOBS"
